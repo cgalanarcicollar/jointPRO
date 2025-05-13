@@ -1,0 +1,181 @@
+---
+title: "Joint Modeling with Simulated PRO Data"
+author: "Cristina Galán-Arcicollar"
+output:
+  html_document: default
+  pdf_document: default
+bibliography: references.bib
+---
+```{r, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,    # Show code
+  warning = FALSE, # Hide warnings
+  message = FALSE,  # Hide messages
+  error = FALSE    # Hide errors (won't stop rendering if code fails)
+)
+```
+
+## Overview
+
+This vignette demonstrates how to simulate and analyze joint longitudinal and survival data using patient-reported outcomes (PROs). We use custom functions for data simulation, model fitting, and dynamic prediction. 
+
+
+```{r load-functions, echo=FALSE}
+library(ggplot2)
+source("sim_jmCOPD.R")
+source("sim_jmPRO.R")
+source("PROjm_plot.R")
+source("JMBB_model.R")
+source("TSBB_model.R")
+source("dynpred_jmPRO.R")
+source("plot_dynpred.R")
+```
+
+## Simulation Settings
+
+Here we define parameters used in the data simulation. These include the number of subjects, follow-up time, model parameters, and event distribution settings.
+
+```{r set-parameters}
+set.seed(8)
+n <- 200
+t.max <- 6.5
+nu <- 1.2
+gamma <- c(-3.5)
+cens <- 0.1
+betas <- c("Intercept" = -0.19, "time" = 0.03)
+ntrial <- 24
+D <- matrix(c(1.6, 0, 0, 0.05), ncol = 2)
+phi <- 0.05
+alpha <- 2
+```
+
+## Simulate Data
+
+We included two simulation functions for the joint data: one based on a generic PRO setting and another emulating a COPD study design.
+
+### Simulated PRO Joint Data
+
+This first dataset uses generic simulation settings to generate longitudinal PRO measurements and associated survival times.
+
+```{r simulate-pro}
+jm_data <- sim_jm.PRO(n = n, t.max = t.max, minobs = 2, betas = betas, 
+                      phi = phi, ntrial = ntrial, alpha = alpha, nu = nu,
+                      gamma = gamma, D = D, type = "p")
+head(jm_data$longitudinal)
+head(jm_data$survival)
+```
+
+### Simulated COPD-Like PRO Joint Data
+
+Here, we use a simulation function that tailors the longitudinal process to mimic the motivating COPD study. See @aramburu2019copd for more information about the COPD study. 
+
+```{r simulate-copd}
+jm_data <- sim_jm.COPD(n = n, t.max = t.max, betas = betas, phi = phi,
+                       ntrial = ntrial, alpha = alpha, nu = nu, gamma = gamma,
+                       D = D, cens = cens, type = "p")
+head(jm_data$longitudinal)
+head(jm_data$survival)
+```
+
+## Visualize Simulated Data
+
+We can visualize the generated longitudinal and survival data for a subset of individuals to inspect the data structure.
+
+```{r plot-simulated}
+plot_longitudinal_survival(
+  data_long = jm_data$longitudinal, outcome_col = "y", time_col = "time",
+  data_surv = jm_data$survival, Time_col = "Time", status_col = "status",
+  id_col = "id", y_max = ntrial, ids = seq(5), max_time = 6.5)
+```
+
+## Fit TSBB Model
+
+The Two-Stage Bayesian Bootstrap (TSBB) model is fitted to the simulated longitudinal and survival data. This model separates the estimation of the longitudinal and survival components, making it computationally efficient and interpretable. It is particularly useful when the association between longitudinal and survival processes can be specified explicitly in a two-step process.
+
+This method is detailed in @galan2024tsbb.
+
+```{r fit-tsbb, results='hide'}
+fixed.formula <- list(y ~ time)
+random.formula <- list(~ -1 + id + time:id)
+
+TSBB_ex <- TSBB(
+  fixed.formula = fixed.formula, random.formula = random.formula,
+  m = ntrial, data_long = jm_data$longitudinal, time_col = "time",
+  outcome_col = "y", id_col = "id", Time = jm_data$survival$Time,
+  status = jm_data$survival$status, data_surv = jm_data$survival,
+  Time_col = "Time", event_col = "status", nDim = 1, type = "p")
+```
+
+## Fit JMBB Model
+
+We now fit the Joint Model Bayesian Bootstrap (JMBB), which jointly estimates the longitudinal and survival models in a fully Bayesian manner.
+
+```{r fit-jmbb,  results='hide'}
+long_data <- jm_data$longitudinal
+long_data$id <- as.numeric(long_data$id)
+surv_data <- jm_data$survival
+
+JMBB_ex <- JMBB(data_long = long_data, id_col = "id", outcome_col = "y", 
+                m = ntrial, meas_col = "time", Time_col = "Time", status_col = "status",
+                data_surv = surv_data, nDim = 1, chains = 3, iter = 2000, 
+                warmup = 1000, type = "p")
+```
+
+## Dynamic Prediction
+
+This section illustrates how to perform dynamic predictions for individual patients using their longitudinal history up to a given time point.
+
+### Split Train/Test
+
+We randomly select two individuals as a test set. The remaining data is used for model training.
+
+```{r train-test-split}
+set.seed(35)
+test_id <- sample(1:n, 2)
+
+test <- long_data[long_data$id %in% test_id, ]
+test_1 <- surv_data[surv_data$id %in% test_id, ]
+
+train <- long_data[!(long_data$id %in% test_id), ]
+train$idx <- match(train$id, unique(train$id))
+train_1 <- surv_data[!(surv_data$id %in% test_id), ]
+train_1$idx <- match(train_1$id, unique(train_1$id))
+```
+
+### Fit on Train Data
+
+We re-fit the JMBB model on the training set only.
+
+```{r train-jmbb}
+JMBB_train <- JMBB(
+  data_long = train, id_col = "idx", outcome_col = "y", m = ntrial,
+  meas_col = "time", Time_col = "Time", status_col = "status",
+  data_surv = train_1, nDim = 1, chains = 3, iter = 2000, warmup = 1000, type = "p")
+```
+
+### Predict One Test ID
+
+We now predict survival for a single test patient, using their longitudinal history.
+
+```{r predict-id}
+Long <- test[test$id == test_id[1], ]
+surv <- test_1[test_1$id == test_id[1], ]
+data_id <- list(longitudinal = Long, survival = surv)
+
+dynpred <- dynpred_jmPRO(id_data = data_id, m = ntrial, jm_fit = JMBB_train, future_time = 3)
+```
+
+### Plot Dynamic Predictions
+
+We visualize the dynamic prediction results for the selected individual.
+
+```{r plot-predictions}
+plots <- plot_dynpred(dynpred, id_data = data_id, m = ntrial, future_time = 3)
+```
+
+## Conclusion
+
+This vignette walks through simulating PRO-based longitudinal and survival data, fitting joint models using two approaches (TSBB and JMBB), and performing subject-specific dynamic predictions. The pipeline can be adapted to real-world data from COPD studies or other chronic conditions.
+
+## References
+
